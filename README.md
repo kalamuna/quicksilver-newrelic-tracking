@@ -6,24 +6,6 @@ This Quicksilver project is used for automation of deployment tracking with New 
 
 This project is designed to be included from a site's `composer.json` file, and placed in its appropriate installation directory by [Composer Installers](https://github.com/composer/installers). 
 
-It has to also include custom quick-silver installer as composer installer doesn't support the quicksilver-script type.
-
-In order for this to work, you should have the following in your composer.json file:
-
-```json
-{
-  "require": {
-    "composer/installers": "^1.0.20",
-    "rvtraveller/qs-composer-installer": "1.0"
-  },
-  "extra": {
-    "installer-paths": {
-      "web/private/scripts/quicksilver/{$name}/": ["type:quicksilver-script"]
-    }
-  }
-}
-```
-
 The project can be included by using the command:
 
 `composer require kalamuna/quicksilver-newrelic-tracking`
