@@ -910,8 +910,15 @@ check(
   strpos(implode("\n", $forbidden), 'User* key') !== FALSE
 );
 
+// 429 is a 25-concurrent-request cap per New Relic user, not a rate quota.
+// Calling it rate limiting sends the operator looking for the wrong thing.
 $throttled = qs_nr_problems(['status' => 429, 'data' => ['errors' => []], 'error' => '']);
-check_contains('a 429 mentions rate limiting', 'rate limiting', implode("\n", $throttled));
+check_contains('a 429 explains it as concurrency', 'concurrent', implode("\n", $throttled));
+check(
+  'and does not call it rate limiting',
+  FALSE,
+  strpos(implode("\n", $throttled), 'rate limit') !== FALSE
+);
 
 $html_500 = qs_nr_problems(['status' => 500, 'data' => NULL, 'error' => '']);
 check_contains('an HTML 500 still reports its status', 'HTTP 500', first($html_500));
@@ -1345,7 +1352,7 @@ check('a non-array input returns NULL', NULL, qs_nr_dig('string', ['a']));
 // Pin the total. Without this, anything that aborts the run early -- an
 // uncaught TypeError from a regression, say -- exits non-zero with zero
 // reported failures, and a truncated run reads as a healthy one.
-$expected_assertions = 294;
+$expected_assertions = 295;
 if ($assertions !== $expected_assertions) {
   $failures++;
   echo "  FAIL  the whole suite ran\n";

@@ -10,8 +10,9 @@ regression from a coincidence.
 - PHP 8.0 or newer. Pantheon's Secrets Manager, which is the only place this
   hook reads its credential from, is not supported on PHP 7.4.
 - Pantheon Secrets Manager. The `secret:site:*` commands are built into
-  Terminus 4.2.0 and newer; on Terminus 3.x they come from the separately
-  installed `terminus-secrets-manager-plugin`.
+  Terminus 4.2.0 and newer; before that, including 4.0.x and 4.1.x, they come
+  from the separately installed `terminus-secrets-manager-plugin` (now
+  deprecated in favour of core).
 - A New Relic **User** API key. License keys and ingest keys do not
   authenticate against NerdGraph.
 
@@ -63,8 +64,8 @@ Once you are in the right account:
    use [one.eu.newrelic.com/api-keys](https://one.eu.newrelic.com/api-keys),
    JP accounts [one.jp.newrelic.com/api-keys](https://one.jp.newrelic.com/api-keys).
 4. Click **Create a key** and choose key type **User**.
-5. Copy the key before leaving the page. Since 2024-09-25 the UI shows only
-   the first 8 characters of an existing key.
+5. Copy the key before leaving the page. Once a key is created, the UI shows
+   only its first 8 characters.
 
 Key type matters. NerdGraph accepts only a **User** key. A license key or an
 ingest key is rejected, which this hook reports in the workflow log. Posting a
@@ -190,8 +191,9 @@ on the dashboard --
 [quicksilver-examples#155](https://github.com/pantheon-systems/quicksilver-examples/issues/155),
 still open, about this very hook.
 
-Two facts sit behind that, and they are easy to run together. `max_execution_time`
-is 120 seconds by default and fires as an uncatchable fatal -- but PHP does not
+Two facts sit behind that, and they are easy to run together. Pantheon sets
+`max_execution_time` to 120 seconds for non-web requests including Quicksilver
+(PHP's own default is 30), and it fires as an uncatchable fatal -- but PHP does not
 count time blocked on the network toward it, so a hung request is never
 interrupted by that timeout at all. A request timeout is the real defence, and
 adding one is exactly what issue #155 asks for.
@@ -214,18 +216,19 @@ with no timeout this hook controls.
 | `no APM application is named exactly "..."` | Most often the key belongs to the wrong New Relic account. Candidates found are listed beneath, because New Relic matches names loosely: a search for `site (live)` also returns `site (lastlive)`. No marker is posted rather than posting it against a near match. A wrong region looks identical, so set `new_relic_region` if the account is not in the US. |
 | `Search stopped after N pages` | The account has more matching applications than the search walked. |
 | `WARNING: the marker was created, but ...` | The marker exists. New Relic also reported a problem, which for APM entities it does without blocking the save. |
-| `HTTP 429` | New Relic is rate limiting. The marker is lost; there is no retry, deliberately, because a deploy hook should not sit and wait. |
+| `HTTP 429` | Too many NerdGraph requests in flight for this New Relic user. The limit is 25 concurrent, not a rate quota, and it clears as those requests drain -- but the Pantheon SSO user is shared across every site, so a busy moment elsewhere can cause it. The marker is lost; there is no retry, deliberately, because a deploy hook should not sit and wait. |
 | `does not understand the workflow type` | The hook is attached to a workflow other than `sync_code` or `deploy`. |
 
 ## Regions
 
 The NerdGraph endpoint defaults to the US host and is otherwise guessed from
 the license key's region prefix: the characters before the first `x` or `X`.
-Real keys look like `eu01xX...`, `eu03XX...`, `euV09x...`, `jp01xX...` and
-`gov01x...`, so only the leading *letters* identify the region -- the digits
-are a cell identifier and vary. Matching whole prefixes would route an `eu03`
-or `jp01` key to the US, which is a silent failure: the US endpoint
-authenticates fine and simply has no such application.
+The token is not restricted to a letters-then-digits shape: New Relic's
+cross-agent fixtures include `eu01xx...`, `gov01x...`, `foo1234x...` and
+`20foox...`. So the region comes from the leading *letters* only, and anything
+unrecognised falls back to US. Matching whole prefixes would route an `eu03` or
+`jp01` key to the US, which is a silent failure: the US endpoint authenticates
+fine and simply has no such application.
 
 That first-`x` convention comes from the PHP agent's daemon, which uses it to
 build a *collector* hostname; only the convention is shared, and an
@@ -243,11 +246,14 @@ terminus secret:site:set <site> new_relic_region EU --type=runtime --scope=web
 Two caveats:
 
 - The FedRAMP endpoint, `gov-api.newrelic.com`, appears in New Relic's own
-  schema-generated Go client but in none of their published documentation. It is
-  supported here on that basis, and a `gov` key routes to it.
-- New Relic documents change tracking as unavailable in some regions and lists
-  the deployment marker API among JP's exclusions. A JP account may reach a
-  valid endpoint and still be unable to record markers.
+  schema-generated Go client but in none of their published documentation. A
+  `gov01x` license prefix is attested in their cross-agent fixtures, so the
+  region is real even though the endpoint is undocumented.
+- New Relic's JP region excludes the legacy "Deployment marker API" and REST
+  v2, and points users at exactly this NerdGraph mutation as the replacement, so
+  a JP account should work. One caveat remains: for APM entities the mutation
+  calls v2 REST internally, which JP also excludes, so a JP deploy may succeed
+  while logging a non-blocking WARNING from that internal call.
 
 ## Development
 

@@ -42,7 +42,10 @@ defined('QS_NR_CHANGELOG_LIMIT') || define('QS_NR_CHANGELOG_LIMIT', 4000);
 defined('QS_NR_DESCRIPTION_LIMIT') || define('QS_NR_DESCRIPTION_LIMIT', 1024);
 defined('QS_NR_VERSION_LIMIT') || define('QS_NR_VERSION_LIMIT', 256);
 defined('QS_NR_USER_LIMIT') || define('QS_NR_USER_LIMIT', 256);
-defined('QS_NR_APPNAME_LIMIT') || define('QS_NR_APPNAME_LIMIT', 256);
+// New Relic's own string-field limit. Bounding lower would be worse than
+// useless: the same value is the exact-match comparison, so truncating it could
+// make a long application name unmatchable.
+defined('QS_NR_APPNAME_LIMIT') || define('QS_NR_APPNAME_LIMIT', 4096);
 
 // Neither a commit message nor an HTTP body has an inherent size limit, and
 // exhausting memory_limit raises an E_ERROR that no catch can absorb.
@@ -370,9 +373,10 @@ function qs_nr_graphql_endpoint(string $license, string $override = ''): string 
 /**
  * Maps a license key's region token to a region name.
  *
- * Real tokens look like eu01, eu03, euV09, jp01 and goV09: the leading letters
- * carry the region and the digits carry the cell, so only the letters can be
- * matched on.
+ * The token is whatever precedes the first "x", and it is not restricted to a
+ * letters-then-digits shape: New Relic's cross-agent fixtures include eu01,
+ * gov01, foo1234 and 20foo. So the region is taken from the leading letters
+ * only, which leaves anything unrecognised as US.
  */
 function qs_nr_region_name(string $region): string {
   $letters = strtolower((string) preg_replace('/[^A-Za-z]/', '', $region));
@@ -972,7 +976,9 @@ function qs_nr_problems(array $result): array {
         . ' Check that it belongs to the account owning this application.';
     }
     if ($status === 429) {
-      $problems[] = 'HTTP 429 means New Relic is rate limiting this user.';
+      $problems[] = 'HTTP 429 means too many NerdGraph requests are in flight for this New Relic'
+        . ' user (the limit is 25 concurrent, and the Pantheon SSO user is shared across sites).'
+        . ' It clears as those requests drain.';
     }
   }
 
