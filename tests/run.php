@@ -845,6 +845,51 @@ check('no newline survives', FALSE, strpos($hostile_error, "\n") !== FALSE);
 check('no escape byte survives', FALSE, strpos($hostile_error, "\x1b") !== FALSE);
 check('the text is bounded', TRUE, strlen($hostile_error) <= 500);
 
+echo "\ntransport result interpretation\n";
+// These decisions used to live inside the curl call, where no test could reach
+// them: whether a failed request is reported at all, which error wins, and
+// whether the body is decoded.
+$good = qs_nr_interpret_response(TRUE, 200, '', FALSE, '{"data":{"x":1}}');
+check('a good response decodes its body', ['x' => 1], $good['data']['data']);
+check('and carries its status', 200, $good['status']);
+check('and reports no error', '', $good['error']);
+
+$failed = qs_nr_interpret_response(FALSE, 0, 'could not resolve host', FALSE, '');
+check('a curl failure is reported, not swallowed', 'could not resolve host', $failed['error']);
+check('and yields no data', NULL, $failed['data']);
+
+$silent = qs_nr_interpret_response(FALSE, 0, '', FALSE, '');
+check('a failure with no curl message still reports one', 'the request failed', $silent['error']);
+
+$over = qs_nr_interpret_response(FALSE, 200, 'Failure writing output', TRUE, 'partial');
+check_contains('overflow wins over curl\'s generic write error', 'was abandoned', $over['error']);
+check('and the partial body is discarded', NULL, $over['data']);
+
+$html = qs_nr_interpret_response(TRUE, 500, '', FALSE, '<html>nope</html>');
+check('a non-JSON body decodes to NULL', NULL, $html['data']);
+check('while keeping the real status', 500, $html['status']);
+check(
+  'a 500 is not laundered into a success',
+  FALSE,
+  qs_nr_problems($html) === []
+);
+
+echo "\nresponse cap boundary\n";
+$at_limit = '';
+$hit = FALSE;
+$exact = qs_nr_response_collector($at_limit, $hit, 8);
+check('a chunk exactly at the cap is accepted', 8, $exact(NULL, '12345678'));
+check('and does not trip the overflow flag', FALSE, $hit);
+check('one byte more is refused', 0, $exact(NULL, '9'));
+check('and does trip it', TRUE, $hit);
+
+echo "\nregion token is matched as a prefix\n";
+// "eu" must anchor at the start: a token merely containing it is not EU.
+check('a token containing but not starting with eu is US', 'US', qs_nr_region_name('xeu01'));
+check('a token starting with eu is EU', 'EU', qs_nr_region_name('eu01'));
+check('quotes and spaces around a license do not misroute it', 'https://api.eu.newrelic.com/graphql',
+  qs_nr_graphql_endpoint("  'eu01xX6789abcdef0123456789abcdef01234567'  "));
+
 echo "\nresponse classification\n";
 check('a clean 200 has no problems', [], qs_nr_problems(['status' => 200, 'data' => ['data' => []], 'error' => '']));
 check(
@@ -1300,7 +1345,7 @@ check('a non-array input returns NULL', NULL, qs_nr_dig('string', ['a']));
 // Pin the total. Without this, anything that aborts the run early -- an
 // uncaught TypeError from a regression, say -- exits non-zero with zero
 // reported failures, and a truncated run reads as a healthy one.
-$expected_assertions = 276;
+$expected_assertions = 294;
 if ($assertions !== $expected_assertions) {
   $failures++;
   echo "  FAIL  the whole suite ran\n";

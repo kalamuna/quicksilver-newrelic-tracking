@@ -896,6 +896,22 @@ function qs_nr_post_graphql(string $endpoint, string $api_key, array $payload): 
   // portable way to free a refcounted CurlHandle.
   unset($handle);
 
+  return qs_nr_interpret_response($ok !== FALSE, $status, $transport_error, $overflowed, $received);
+}
+
+/**
+ * Turns a completed curl attempt into a result array.
+ *
+ * Split from the curl mechanics so the decisions -- whether a request failed,
+ * which error wins, and whether the body is decoded -- are testable without a
+ * socket.
+ *
+ * @return array
+ *   Keys: 'status' (int), 'data' (decoded body or NULL), 'error' (string).
+ */
+function qs_nr_interpret_response(bool $ok, int $status, string $transport_error, bool $overflowed, string $body): array {
+  // Overflow first: curl reports an aborted transfer as a generic write error,
+  // which would otherwise hide the real reason.
   if ($overflowed) {
     return [
       'status' => $status,
@@ -904,7 +920,7 @@ function qs_nr_post_graphql(string $endpoint, string $api_key, array $payload): 
     ];
   }
 
-  if ($ok === FALSE) {
+  if (!$ok) {
     return [
       'status' => $status,
       'data' => NULL,
@@ -914,7 +930,7 @@ function qs_nr_post_graphql(string $endpoint, string $api_key, array $payload): 
 
   return [
     'status' => $status,
-    'data' => json_decode($received, TRUE),
+    'data' => json_decode($body, TRUE),
     'error' => '',
   ];
 }
