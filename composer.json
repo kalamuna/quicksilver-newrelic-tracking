@@ -3,7 +3,14 @@
   "description": "Quicksilver project is used for automation of deployment tracking with New Relic on Pantheon platform.",
   "type": "quicksilver-script",
   "require": {
+    "php": ">=8.0",
     "composer/installers": "^2.0.1"
+  },
+  "scripts": {
+    "test": "php tests/run.php"
+  },
+  "scripts-descriptions": {
+    "test": "Runs the payload and workflow-handling tests."
   },
   "license": "MIT"
 }
