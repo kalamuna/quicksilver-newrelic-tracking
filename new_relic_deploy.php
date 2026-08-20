@@ -2,200 +2,75 @@
 
 /**
  * @file
- * Quicksilver hook: record a New Relic deployment marker.
+ * Quicksilver hook: records a New Relic deployment marker on each deploy.
  *
- * Both halves of the original implementation have been retired by their
- * vendors, which is why this script was rewritten:
+ * Uses the NerdGraph changeTrackingCreateDeployment mutation, authenticated by
+ * a New Relic User API key held in Pantheon Secrets Manager. The predecessor
+ * read credentials from Pantheon's "newrelic" platform binding and posted to
+ * the Deployments v0 REST API; both have been retired by their vendors.
  *
- * - Pantheon removed the "newrelic" platform binding. A request to
- *   /sites/self/bindings?type=newrelic now answers HTTP 200 with an empty
- *   object, so the old credential lookup could never succeed. Pantheon's own
- *   example dropped binding usage in May 2024 (LOPS-2264).
- * - New Relic's REST API v2 and Deployments v0 API ("deployments.xml") reach
- *   end of life on 2027-07-31. Deployment markers are now created with the
- *   NerdGraph changeTrackingCreateDeployment mutation.
- *
- * One-time setup per site:
- *
- * 1. Get a New Relic *User* API key. Pantheon-provisioned New Relic accounts
- *    are reached by single sign-on: Site Dashboard, pick an environment, the
- *    New Relic tab, then "Go to New Relic". From there open
- *    https://one.newrelic.com/api-keys (EU accounts: one.eu.newrelic.com),
- *    create a key of type "User", and copy it before leaving the page.
- *    A license key or an ingest key will NOT authenticate against NerdGraph.
- *
- * 2. Store it as a Pantheon secret that PHP can read. Both flags matter:
- *    only the "runtime" type is visible to pantheon_get_secret(), and the
- *    type cannot be changed later without deleting the secret.
- *
- *      terminus secret:site:set <site> new_relic_api_key <KEY> \
- *        --type=runtime --scope=web
- *
- *    Pantheon caches secrets for up to 15 minutes, including for Quicksilver,
- *    so the first deploy after setting it may still report the key missing.
- *
- * 3. Add the hooks to pantheon.yml. See README.md.
- *
- * When the marker cannot be posted, the reason is explained in the workflow
- * log and the script returns normally rather than throwing.
- *
- * That is not the same as being unable to affect the deploy. Pantheon's own
- * tracker records that a Quicksilver script whose PHP worker hangs marks the
- * deploy workflow failed on the dashboard (quicksilver-examples#155, still
- * open, about this very hook).
- *
- * Two separate facts matter here, and they are easy to conflate:
- *
- * - max_execution_time, 120 seconds by default on Pantheon, fires as an
- *   uncatchable fatal. It is a configurable ini setting, not a hard platform
- *   kill.
- * - PHP does not count time blocked on the network toward it, so a hung
- *   request is not interrupted by that timeout at all. CURLOPT_TIMEOUT is the
- *   real defence, and adding one is exactly what issue #155 asks for.
- *
- * So: QS_NR_HTTP_TIMEOUT bounds each request, QS_NR_MAX_SEARCH_PAGES bounds
- * how many are made, and QS_NR_TOTAL_BUDGET trims pagination early when
- * requests are slow. The two pantheon_get_secret() reads are outside all of
- * that -- they are remote calls with no timeout this hook controls.
- *
- * @see https://docs.newrelic.com/docs/change-tracking/change-tracking-graphql/
- * @see https://docs.newrelic.com/eol/2026/07/eol-07-31-26-rest-api-v2/
+ * See README.md for setup, troubleshooting, and the reasoning behind the
+ * deploy-tag, region and bounding choices.
  */
 
-// This file is a Quicksilver entry point, not a library. Each hook entry in
-// pantheon.yml runs in its own request, so it is never loaded twice in one
-// process. Note that a guard here could not help if it were: PHP binds
-// top-level function declarations at compile time, before any statement in the
-// file runs, so an early `return` cannot prevent a redeclaration fatal.
-// Only the constants are guarded, because tests load the file deliberately.
-
-// Traces must never carry argument values: the API key is passed as a scalar
-// to the transport, and PHP includes scalar arguments in fatal-error traces.
+// Keep argument values out of fatal-error traces: the API key is passed as a
+// scalar to the transport.
 @ini_set('zend.exception_ignore_args', '1');
 
-// This request is plumbing, not site traffic. Keep it out of APM. The function
-// is checked as well as the extension: this runs at file scope, outside the
-// exception guard below, so an undefined function here would be fatal.
+// This request is plumbing, not site traffic. Both checks are needed because
+// this runs at file scope, outside the exception guard in qs_nr_main().
 if (extension_loaded('newrelic') && function_exists('newrelic_ignore_transaction')) {
   newrelic_ignore_transaction();
 }
 
-/**
- * Name of the Pantheon secret holding a New Relic User API key.
- */
+// Guarded individually so tests can load this file deliberately. Note that a
+// whole-file include guard would not work: PHP binds top-level functions at
+// compile time, before any statement here runs.
 defined('QS_NR_SECRET_NAME') || define('QS_NR_SECRET_NAME', 'new_relic_api_key');
-
-/**
- * Optional secret naming the New Relic region, for accounts outside the US.
- *
- * Accepts "US", "EU" or "JP", or a full documented NerdGraph URL. Only needed
- * when the region guessed from the license key is wrong.
- */
 defined('QS_NR_ENDPOINT_SECRET_NAME') || define('QS_NR_ENDPOINT_SECRET_NAME', 'new_relic_region');
 
-/**
- * Seconds to wait for a connection, and for a whole request.
- */
 defined('QS_NR_CONNECT_TIMEOUT') || define('QS_NR_CONNECT_TIMEOUT', 5);
 defined('QS_NR_HTTP_TIMEOUT') || define('QS_NR_HTTP_TIMEOUT', 15);
 
-/**
- * Longest values to send, in bytes.
- *
- * New Relic trims string fields itself at 4096 characters and appends an
- * ellipsis, unless FAIL_ON_FIELD_LENGTH is passed, which this hook does not
- * send. So the choice is not "truncate or lose the marker" but "choose where
- * the cut lands, or let New Relic cut mid-word". Bounding here also keeps a
- * huge commit message from being uploaded on every deploy.
- *
- * Every field derived from the repository is bounded, not just the changelog:
- * a commit subject is as attacker-sized as a commit body.
- */
+// Seconds the hook may spend before it stops paginating. A hung worker marks
+// the whole deploy workflow failed, which is worse than a missing marker.
+defined('QS_NR_TOTAL_BUDGET') || define('QS_NR_TOTAL_BUDGET', 45);
+
+// New Relic trims string fields at 4096 characters itself; bounding here just
+// chooses where the cut lands and keeps huge commit messages off the wire.
 defined('QS_NR_CHANGELOG_LIMIT') || define('QS_NR_CHANGELOG_LIMIT', 4000);
 defined('QS_NR_DESCRIPTION_LIMIT') || define('QS_NR_DESCRIPTION_LIMIT', 1024);
 defined('QS_NR_VERSION_LIMIT') || define('QS_NR_VERSION_LIMIT', 256);
 defined('QS_NR_USER_LIMIT') || define('QS_NR_USER_LIMIT', 256);
+defined('QS_NR_APPNAME_LIMIT') || define('QS_NR_APPNAME_LIMIT', 256);
 
-/**
- * Longest git output to read into memory, in bytes.
- *
- * A commit message has no size limit, and shell_exec() buffers whatever it is
- * given. Without this bound a single pushed commit could exhaust memory_limit,
- * and the resulting E_ERROR is uncatchable, so it would fail the deployment
- * this hook promises never to disturb.
- */
+// Neither a commit message nor an HTTP body has an inherent size limit, and
+// exhausting memory_limit raises an E_ERROR that no catch can absorb.
 defined('QS_NR_GIT_OUTPUT_LIMIT') || define('QS_NR_GIT_OUTPUT_LIMIT', 65536);
-
-/**
- * Longest HTTP response body to read into memory, in bytes.
- *
- * The same reasoning as the git cap, for the same reason: buffering an
- * unbounded body is an uncatchable fatal. A NerdGraph answer to either of
- * these documents is a few kilobytes, so anything approaching this is a
- * malfunction upstream rather than a large legitimate response.
- */
 defined('QS_NR_RESPONSE_LIMIT') || define('QS_NR_RESPONSE_LIMIT', 1048576);
 
-/**
- * The ini default when New Relic is not configured for the environment.
- *
- * ini_get() returns this rather than an empty string, so it has to be
- * recognised or the hook would search New Relic for "PHP Application".
- */
+// ini_get() returns this when New Relic is not configured, rather than ''.
 defined('QS_NR_APPNAME_DEFAULT') || define('QS_NR_APPNAME_DEFAULT', 'PHP Application');
 
+// One entity search page holds at most 200 entities.
+defined('QS_NR_MAX_SEARCH_PAGES') || define('QS_NR_MAX_SEARCH_PAGES', 3);
+defined('QS_NR_MAX_CANDIDATES_LOGGED') || define('QS_NR_MAX_CANDIDATES_LOGGED', 20);
+defined('QS_NR_MAX_PROBLEMS_REPORTED') || define('QS_NR_MAX_PROBLEMS_REPORTED', 10);
+
 /**
- * Workflow types that mean "new code arrived in this environment".
- *
- * Integrated Composer sites report sync_code_with_build rather than
- * sync_code, and that value is not documented by Pantheon.
+ * Workflow types meaning "new code arrived". Integrated Composer sites report
+ * sync_code_with_build, which Pantheon does not document.
  */
 function qs_nr_sync_workflow_types(): array {
   return ['sync_code', 'sync_code_with_build'];
 }
 
 /**
- * Most entity search pages to walk before giving up.
- *
- * NerdGraph returns at most 200 entities per page and the name filter is a
- * substring match, so a large account can push the exact match onto a later
- * page. The cap keeps a pathological account from stalling the workflow.
- */
-defined('QS_NR_MAX_SEARCH_PAGES') || define('QS_NR_MAX_SEARCH_PAGES', 3);
-
-/**
- * Most candidate names to print when no exact match is found.
- */
-defined('QS_NR_MAX_CANDIDATES_LOGGED') || define('QS_NR_MAX_CANDIDATES_LOGGED', 20);
-
-/**
- * Most GraphQL error entries to echo from one response.
- */
-defined('QS_NR_MAX_PROBLEMS_REPORTED') || define('QS_NR_MAX_PROBLEMS_REPORTED', 10);
-
-/**
- * Longest APM application name to send, in bytes.
- */
-defined('QS_NR_APPNAME_LIMIT') || define('QS_NR_APPNAME_LIMIT', 256);
-
-/**
- * Seconds the whole hook may spend before it stops paginating.
- *
- * A hung worker marks the deploy workflow failed, and max_execution_time
- * defaults to 120 seconds. Per-request timeouts alone do not bound the total
- * number of requests, so the search stops walking pages once this is spent.
- * Note what it cannot cover: the mutation is still attempted afterwards, and
- * the secrets reads happen before the clock is ever consulted.
- */
-defined('QS_NR_TOTAL_BUDGET') || define('QS_NR_TOTAL_BUDGET', 45);
-
-/**
  * Entry point: runs the hook and absorbs anything it throws.
  *
- * A deploy marker is never worth a stack trace in a deployment log, and the
- * platform functions this hook calls are outside its control. pantheon_get_secret()
- * in particular talks to a remote service and is not documented to be
- * exception-free.
+ * A deploy marker is never worth a stack trace in a deployment log, and
+ * pantheon_get_secret() talks to a remote service with no documented failure
+ * contract.
  */
 function qs_nr_main(array $post, ?callable $transport = NULL, ?array $config = NULL): bool {
   try {
@@ -216,20 +91,21 @@ function qs_nr_main(array $post, ?callable $transport = NULL, ?array $config = N
  * @param array $post
  *   The Quicksilver POST body.
  * @param callable|null $transport
- *   Receives (endpoint, api_key, payload) and returns the qs_nr_post_graphql()
- *   result shape. Injected so the wiring can be tested without a network.
+ *   Receives (endpoint, api_key, payload), returns a qs_nr_post_graphql()
+ *   result. Injected for testing.
  * @param array|null $config
- *   Overrides the platform-derived configuration: 'api_key', 'app_name' and
- *   'endpoint'. Injected for the same reason; the platform values come from a
- *   PHP extension and a secrets backend that cannot be simulated in-process.
+ *   Optional per-key overrides: 'api_key', 'app_name', 'endpoint', 'git',
+ *   'clock'. Anything absent is read from the platform.
  */
 function qs_nr_run(array $post, ?callable $transport = NULL, ?array $config = NULL): bool {
+  $config = (array) $config;
   $transport = $transport ?? 'qs_nr_post_graphql';
   $git = $config['git'] ?? 'qs_nr_git';
   $clock = $config['clock'] ?? static function (): float {
     return microtime(TRUE);
   };
   $deadline = $clock() + QS_NR_TOTAL_BUDGET;
+
   $wf_type = qs_nr_scalar($post, 'wf_type');
   if ($wf_type !== 'deploy' && !in_array($wf_type, qs_nr_sync_workflow_types(), TRUE)) {
     qs_nr_say('Nothing to record: this hook does not understand the workflow type "'
@@ -238,9 +114,7 @@ function qs_nr_run(array $post, ?callable $transport = NULL, ?array $config = NU
     return FALSE;
   }
 
-  // Per-key fallback, so a caller stubbing one value does not silently blank
-  // the others.
-  $api_key = array_key_exists('api_key', (array) $config) ? $config['api_key'] : qs_nr_api_key();
+  $api_key = array_key_exists('api_key', $config) ? $config['api_key'] : qs_nr_api_key();
   if ($api_key === NULL) {
     qs_nr_say('ERROR: no usable New Relic API key.');
     qs_nr_say('Store a New Relic *User* API key in the "' . QS_NR_SECRET_NAME . '" secret:');
@@ -250,7 +124,7 @@ function qs_nr_run(array $post, ?callable $transport = NULL, ?array $config = NU
     return FALSE;
   }
 
-  $app_name = array_key_exists('app_name', (array) $config)
+  $app_name = array_key_exists('app_name', $config)
     ? $config['app_name']
     : qs_nr_app_name((string) ini_get('newrelic.appname'));
   if ($app_name === NULL) {
@@ -268,7 +142,7 @@ function qs_nr_run(array $post, ?callable $transport = NULL, ?array $config = NU
     qs_nr_say('NOTE: this is not a git checkout, so commit details will be incomplete.');
   }
 
-  $endpoint = array_key_exists('endpoint', (array) $config)
+  $endpoint = array_key_exists('endpoint', $config)
     ? $config['endpoint']
     : qs_nr_graphql_endpoint((string) ini_get('newrelic.license'), qs_nr_region_override());
 
@@ -281,10 +155,8 @@ function qs_nr_run(array $post, ?callable $transport = NULL, ?array $config = NU
     $pages++;
     $search = $transport($endpoint, $api_key, qs_nr_entity_search_payload($app_name, $cursor));
 
-    // Read the result before judging the errors array, the same way the
-    // mutation below does. GraphQL returns partial data with a populated
-    // `errors` array for shard and field-level failures, so an entity that
-    // was found is still worth using.
+    // GraphQL returns partial data alongside an errors array for shard and
+    // field-level failures, so an entity that was found is still usable.
     $guid = qs_nr_extract_entity_guid($search['data'] ?? NULL, $app_name);
     if ($guid !== NULL) {
       foreach (qs_nr_problems($search) as $problem) {
@@ -297,7 +169,6 @@ function qs_nr_run(array $post, ?callable $transport = NULL, ?array $config = NU
       return FALSE;
     }
 
-    // Keep only as many names as will ever be printed.
     $seen = array_slice(
       array_merge($seen, qs_nr_entity_names($search['data'] ?? NULL)),
       0,
@@ -309,9 +180,6 @@ function qs_nr_run(array $post, ?callable $transport = NULL, ?array $config = NU
       break;
     }
 
-    // Stop walking pages once the hook has spent its budget. A killed worker
-    // marks the whole deploy workflow failed, which is far worse than a
-    // missing marker.
     if ($clock() >= $deadline) {
       qs_nr_say('NOTE: stopped searching after ' . QS_NR_TOTAL_BUDGET
         . ' seconds to stay inside the Quicksilver time limit.');
@@ -329,8 +197,6 @@ function qs_nr_run(array $post, ?callable $transport = NULL, ?array $config = NU
     if ($cursor !== NULL && !$stopped_early) {
       qs_nr_say('Search stopped after ' . $pages . ' page(s) with more results available.');
     }
-    // Enough to diagnose a near-miss without turning a large account into
-    // thousands of log lines.
     foreach (array_slice($seen, 0, QS_NR_MAX_CANDIDATES_LOGGED) as $name) {
       qs_nr_say('  candidate seen: ' . $name);
     }
@@ -343,26 +209,19 @@ function qs_nr_run(array $post, ?callable $transport = NULL, ?array $config = NU
   $deployment = qs_nr_build_deployment($post, $git, qs_nr_environment($post));
   $deployment['entityGuid'] = $guid;
 
-  // The GUID comes from an HTTP response and the app name from an ini setting;
-  // neither is this hook's own data, so both are sanitised before logging.
   qs_nr_say('Recording deployment "' . qs_nr_printable($deployment['version'])
     . '" against ' . qs_nr_printable($app_name) . ' (' . qs_nr_printable($guid) . ')...');
 
   $result = $transport($endpoint, $api_key, qs_nr_deployment_payload($deployment));
 
-  // Read the result before judging the errors array. With no dataHandlingRules
-  // sent, New Relic documents that a legacy REST failure behind an APM entity
-  // is reported in `errors` without blocking the save, so errors and a real
-  // deployment can arrive together.
+  // With no dataHandlingRules sent, a legacy REST failure behind an APM entity
+  // is reported without blocking the save, so errors and a real deployment can
+  // arrive together. Read the result first, then judge the errors.
   $created = qs_nr_dig($result['data'] ?? NULL, ['data', 'changeTrackingCreateDeployment']);
   $id = is_array($created) ? ($created['deploymentId'] ?? NULL) : NULL;
-  // New Relic generates this as a string. A bool, a float or a zero means the
-  // response is not what it claims, and reporting "deployment ID 1" for a
-  // literal TRUE would announce a success that did not happen. The status has
-  // to be a success too: a 500 carrying a deployment did not create one.
-  $status_ok = ((int) ($result['status'] ?? 0)) >= 200 && ((int) ($result['status'] ?? 0)) < 300;
+  $status = (int) ($result['status'] ?? 0);
   $plausible = (is_string($id) && trim($id) !== '') || (is_int($id) && $id > 0);
-  $id = $status_ok && $plausible ? (string) $id : NULL;
+  $id = $status >= 200 && $status < 300 && $plausible ? (string) $id : NULL;
 
   if ($id === NULL) {
     qs_nr_report($result, 'deployment marker');
@@ -381,7 +240,7 @@ function qs_nr_run(array $post, ?callable $transport = NULL, ?array $config = NU
 }
 
 /**
- * Reads a POST field as a string, tolerating arrays and missing keys.
+ * Reads a POST field as a trimmed string, tolerating arrays and missing keys.
  */
 function qs_nr_scalar(array $post, string $key): string {
   $value = $post[$key] ?? '';
@@ -419,10 +278,9 @@ function qs_nr_region_override(): string {
 /**
  * Validates an API key for use in an HTTP header.
  *
- * Secrets routinely pick up a trailing newline in transit. A newline or space
- * inside a header value corrupts the whole request, and New Relic reports that
- * as "Invalid JSON" rather than as an auth problem, so reject it here where
- * the message can be accurate.
+ * Stored secrets routinely pick up a trailing newline. Printable ASCII is the
+ * gate because whitespace, NUL bytes and non-breaking spaces all corrupt the
+ * header and surface as a baffling 401 rather than a configuration error.
  */
 function qs_nr_clean_api_key(string $key): ?string {
   $key = trim($key);
@@ -430,10 +288,6 @@ function qs_nr_clean_api_key(string $key): ?string {
     return NULL;
   }
 
-  // Printable ASCII only. A whitespace test alone would pass a NUL byte, which
-  // libcurl silently truncates the header at, and non-breaking or line
-  // separator characters, which arrive verbatim. Any of those produce a
-  // baffling 401 rather than an obvious configuration error.
   if (preg_match('/^[\x21-\x7E]+$/', $key) !== 1) {
     qs_nr_say('NOTE: the API key contains whitespace or non-printable characters, which would');
     qs_nr_say('corrupt the request. Re-save the "' . QS_NR_SECRET_NAME . '" secret.');
@@ -446,8 +300,8 @@ function qs_nr_clean_api_key(string $key): ?string {
 /**
  * Resolves the APM application name from the raw ini value.
  *
- * New Relic accepts a semicolon-separated list where the extra names are
- * rollup applications; only the first is the entity this deploy belongs to.
+ * The ini value may be a semicolon-separated list; only the first entry is the
+ * entity this deploy belongs to, the rest being rollup applications.
  */
 function qs_nr_app_name(string $raw): ?string {
   $primary = trim(explode(';', $raw)[0]);
@@ -456,9 +310,8 @@ function qs_nr_app_name(string $raw): ?string {
     return NULL;
   }
 
-  // A control character cannot appear in a New Relic entity name, so a name
-  // carrying one can never match. Refusing it beats reporting that two
-  // identical-looking strings did not match.
+  // No entity name can contain a control character, so such a name could never
+  // match. Refusing beats reporting that two identical-looking names differ.
   if (preg_match('/[\x00-\x1F\x7F]/', $primary) === 1) {
     qs_nr_say('NOTE: newrelic.appname contains control characters and cannot match an entity.');
     return NULL;
@@ -468,23 +321,16 @@ function qs_nr_app_name(string $raw): ?string {
 }
 
 /**
- * The NerdGraph endpoints New Relic documents, keyed by region.
+ * NerdGraph endpoints by region.
  *
- * Only these three are documented. A FedRAMP "gov" NerdGraph endpoint is not
- * published, and the plausible-looking gov-api.newrelic.com answers
- * identically to the US host, so guessing at one would fake support rather
- * than provide it.
- *
- * @see https://docs.newrelic.com/docs/apis/nerdgraph/get-started/introduction-new-relic-nerdgraph/
+ * GOV is absent from New Relic's published docs but present in their own
+ * schema-generated client (newrelic-client-go pkg/region/region_constants.go).
  */
 function qs_nr_endpoints(): array {
   return [
     'US' => 'https://api.newrelic.com/graphql',
     'EU' => 'https://api.eu.newrelic.com/graphql',
     'JP' => 'https://api.jp.newrelic.com/graphql',
-    // Absent from New Relic's published docs, but present in their own
-    // schema-generated Go client as the FedRAMP deployment's NerdGraph host.
-    // @see newrelic/newrelic-client-go pkg/region/region_constants.go
     'GOV' => 'https://gov-api.newrelic.com/graphql',
   ];
 }
@@ -492,22 +338,9 @@ function qs_nr_endpoints(): array {
 /**
  * Returns the NerdGraph endpoint to use.
  *
- * Region cannot be read off a User API key, so this is a best guess from the
- * license key's region prefix: the characters before the first "x" or "X", as
- * in "eu01xX...", "eu03XX...", "euV09x...", "jp01xX..." or "gov01x...". Only
- * the leading letters identify the region -- the digits vary per cell, so
- * matching whole prefixes would route eu03 and jp01 keys to the US.
- *
- * That delimiter convention comes from the PHP agent's daemon, which uses it
- * to derive a *collector* hostname; only the convention is borrowed, and an
- * unrecognised region falls back to US rather than being turned into a
- * hostname.
- *
- * @see newrelic/newrelic-java-agent AgentConfigImplTest for the real prefixes.
- *
- * The guess is only sound while the license key and the User API key belong to
- * the same New Relic account, which is the normal case but is not guaranteed.
- * Pass $override, from the optional endpoint secret, to state it explicitly.
+ * Region is not recoverable from a User API key, so it is guessed from the
+ * license key's prefix and can be overridden. The guess holds only while both
+ * credentials belong to the same New Relic account.
  */
 function qs_nr_graphql_endpoint(string $license, string $override = ''): string {
   $endpoints = qs_nr_endpoints();
@@ -521,14 +354,13 @@ function qs_nr_graphql_endpoint(string $license, string $override = ''): string 
     if (isset($endpoints[$named])) {
       return $endpoints[$named];
     }
-    // Deliberately not echoing the value. This is read from a secret, and an
-    // operator who transposes the arguments of two secret:site:set commands
-    // would otherwise print their API key into a durable workflow log.
+    // The value is not echoed: transposing two secret:site:set commands would
+    // otherwise print an API key into a durable workflow log.
     qs_nr_say('NOTE: the "' . QS_NR_ENDPOINT_SECRET_NAME . '" secret is not a region this hook knows.');
     qs_nr_say('Set it to one of: ' . implode(', ', array_keys($endpoints)) . '. Falling back to US.');
   }
 
-  // Strip the quotes and whitespace that ini values pick up in the wild.
+  // ini values pick up stray quotes and whitespace in the wild.
   $license = trim($license, " \t\n\r\0\x0B\"'");
   $region = preg_match('/^(.+?)[xX]/', $license, $matches) === 1 ? $matches[1] : '';
 
@@ -538,8 +370,9 @@ function qs_nr_graphql_endpoint(string $license, string $override = ''): string 
 /**
  * Maps a license key's region token to a region name.
  *
- * The token's leading letters carry the region and its digits carry the cell,
- * so "eu01", "eu03" and "euV09" are all EU.
+ * Real tokens look like eu01, eu03, euV09, jp01 and goV09: the leading letters
+ * carry the region and the digits carry the cell, so only the letters can be
+ * matched on.
  */
 function qs_nr_region_name(string $region): string {
   $letters = strtolower((string) preg_replace('/[^A-Za-z]/', '', $region));
@@ -556,11 +389,9 @@ function qs_nr_region_name(string $region): string {
 /**
  * Returns the Pantheon environment name, or an empty string if unknown.
  *
- * The workflow payload is preferred over the PANTHEON_ENVIRONMENT constant:
- * `environment` is a documented Quicksilver variable, whereas the constant is
- * a platform detail that a webphp hook merely happens to inherit. Either way
- * this drives deploy-tag selection, so losing it degrades the marker's version
- * to a bare commit SHA.
+ * The workflow payload is preferred: `environment` is a documented Quicksilver
+ * variable, whereas PANTHEON_ENVIRONMENT is a platform detail a webphp hook
+ * merely inherits.
  */
 function qs_nr_environment(array $post = []): string {
   $from_payload = qs_nr_scalar($post, 'environment');
@@ -572,17 +403,9 @@ function qs_nr_environment(array $post = []): string {
 }
 
 /**
- * Runs a git command in the current working directory and returns its stdout.
+ * Runs a git command in the current directory and returns its trimmed stdout.
  *
- * Quicksilver runs from inside the deployed checkout, so no path is passed.
- * If that ever stops being true, every git-derived field degrades to its
- * fallback and the "not a git checkout" note in qs_nr_run() fires.
- *
- * Output is capped in the shell, before it reaches PHP, because a commit
- * message is unbounded and attacker-sized: buffering one whole into a PHP
- * string can exhaust memory_limit, and that fatal cannot be caught.
- *
- * Callers are responsible for escaping any interpolated values.
+ * Callers must escape any interpolated values.
  */
 function qs_nr_git(string $arguments): string {
   if (!function_exists('shell_exec')) {
@@ -595,40 +418,31 @@ function qs_nr_git(string $arguments): string {
 }
 
 /**
- * Builds the shell command for a git read, including the output cap.
- *
- * Separated so the cap can be asserted; without it a single large commit
- * message is enough to exhaust memory_limit.
+ * Builds the shell command for a git read, capping its output.
  */
 function qs_nr_git_command(string $arguments): string {
   return 'git ' . $arguments . ' 2>/dev/null | head -c ' . QS_NR_GIT_OUTPUT_LIMIT;
 }
 
 /**
- * Builds the ChangeTrackingDeploymentInput fields for this workflow.
- *
- * Pure apart from the injected $git reader, so the shape of every workflow
- * type can be asserted in tests.
+ * Builds the ChangeTrackingDeploymentInput fields, minus entityGuid.
  *
  * @param array $post
  *   The Quicksilver POST body.
  * @param callable $git
  *   Receives a git argument string, returns trimmed stdout.
  * @param string $environment
- *   The Pantheon environment being deployed to.
+ *   The environment being deployed to.
  * @param int|null $now_ms
  *   Marker timestamp in milliseconds. Defaults to now.
- *
- * @return array
- *   Deployment input fields, minus entityGuid.
  */
 function qs_nr_build_deployment(array $post, callable $git, string $environment, ?int $now_ms = NULL): array {
   $wf_type = qs_nr_scalar($post, 'wf_type');
 
   if ($wf_type === 'deploy') {
-    // Deploys promote an existing commit, and on test and live the tip commit
-    // is Pantheon's own build artifact rather than anyone's work, so the
-    // deploy tag is the only meaningful version.
+    // On test and live the tip commit is Pantheon's own build artifact, not
+    // anyone's work, so its subject and author are useless and the deploy tag
+    // is the only meaningful version.
     $tag = qs_nr_deploy_tag($git, $environment);
     $version = $tag !== '' ? $tag : $git('log --pretty=format:%h -1');
     $description = $environment !== ''
@@ -637,14 +451,13 @@ function qs_nr_build_deployment(array $post, callable $git, string $environment,
     $changelog = $tag !== '' ? qs_nr_tag_annotation($git, $tag) : '';
   }
   else {
-    // A code sync carries a real authored commit at the tip.
     $version = $git('log --pretty=format:%h -1');
     $subject = $git('log --pretty=format:%s -1');
     $description = $subject !== '' ? $subject : 'Code synced via Pantheon';
     $changelog = $git('log --pretty=format:%b -1');
   }
 
-  // The schema requires a non-empty version, so never send an empty string.
+  // The schema requires a non-empty version.
   if (trim($version) === '') {
     $version = 'unknown';
   }
@@ -656,15 +469,15 @@ function qs_nr_build_deployment(array $post, callable $git, string $environment,
     'timestamp' => $now_ms ?? (int) round(microtime(TRUE) * 1000),
   ];
 
+  // Identifier-shaped fields are cut without an ellipsis: a trailing "..." on
+  // an address would split one deployer into two when faceting markers.
   $user = qs_nr_deploying_user($post, $git);
   if ($user !== '') {
-    // Cut without an ellipsis: "...' on the end of an address would split one
-    // deployer into two when faceting markers by user.
     $deployment['user'] = qs_nr_cut($user, QS_NR_USER_LIMIT);
   }
 
-  // Clamp the body before appending the provenance note, so that truncating a
-  // huge commit message cannot delete the line explaining where it came from.
+  // Clamp the body before appending provenance, so truncation cannot delete
+  // the line explaining where the code came from.
   $provenance = qs_nr_provenance($wf_type, $post);
   $body = qs_nr_clamp(trim($changelog), max(0, QS_NR_CHANGELOG_LIMIT - strlen($provenance) - 2));
   $deployment['changelog'] = trim($body . "\n\n" . $provenance);
@@ -678,25 +491,23 @@ function qs_nr_build_deployment(array $post, callable $git, string $environment,
 }
 
 /**
- * Finds the deploy tag for this environment on the deployed commit.
+ * Finds this environment's deploy tag on the deployed commit.
  *
- * `git describe` walks backwards to the nearest *ancestor* tag, which on a
- * real Pantheon repository means a previous release's tag rather than this
- * one. Only tags that point at HEAD describe this deploy.
- *
- * A single commit routinely carries tags for several environments, because
- * promoting to live re-tags the commit already tagged for test, so the tag
- * matching this environment wins and the highest sequence number breaks ties.
+ * Only tags pointing at HEAD describe this deploy: `git describe` walks back to
+ * the nearest ancestor tag, which on a Pantheon repository is a previous
+ * release. A commit routinely carries tags for several environments, because
+ * promoting to live re-tags a commit already tagged for test.
  */
 function qs_nr_deploy_tag(callable $git, string $environment): string {
   $listing = $git('tag --points-at HEAD');
   $lines = explode("\n", $listing);
-  // The git read is byte-capped, so the final line may be a fragment of a real
-  // tag name. A fragment still looks like a valid name, so drop it rather than
-  // name a tag that does not exist.
+
+  // The read is byte-capped, so the last line may be a fragment of a real tag
+  // name -- and a fragment still looks like a valid name.
   if (strlen($listing) >= QS_NR_GIT_OUTPUT_LIMIT - 1 && count($lines) > 1) {
     array_pop($lines);
   }
+
   $tags = array_values(array_filter(array_map('trim', $lines), 'qs_nr_tag_is_safe'));
   if ($tags === []) {
     return '';
@@ -706,19 +517,15 @@ function qs_nr_deploy_tag(callable $git, string $environment): string {
     return qs_nr_non_platform_tag($tags);
   }
 
-  // Only a purely numeric suffix counts as this environment's deploy tag.
-  // Pantheon's own tags look like pantheon_live_23; anything else pointing at
-  // HEAD was put there by hand, and a name like pantheon_live_43abc would
-  // otherwise cast to 43 and tie with, or beat, the genuine tag.
+  // A hand-made name like pantheon_live_43abc would cast to 43 and tie with
+  // the genuine tag, and a 20-digit one would saturate to PHP_INT_MAX, so the
+  // suffix must be a short run of digits to count.
   $prefix = 'pantheon_' . $environment . '_';
   $matching = [];
   foreach ($tags as $tag) {
     if (strpos($tag, $prefix) !== 0) {
       continue;
     }
-    // Digits only, and few enough that the integer cast cannot saturate:
-    // "pantheon_live_999...9" would otherwise cast to PHP_INT_MAX and outrank
-    // every genuine tag. Pantheon's sequences are small counters.
     $sequence = substr($tag, strlen($prefix));
     if (preg_match('/^\d{1,9}$/', $sequence) !== 1) {
       continue;
@@ -730,9 +537,8 @@ function qs_nr_deploy_tag(callable $git, string $environment): string {
     return qs_nr_non_platform_tag($tags);
   }
 
-  // Highest sequence wins; equal sequences (pantheon_live_8 against
-  // pantheon_live_08) fall back to the name, so the choice is never decided by
-  // the order git happened to list refs in.
+  // Highest sequence wins, breaking ties on the name so the choice never
+  // depends on the order git listed refs in.
   $best = $matching[0];
   foreach ($matching as $candidate) {
     if ($candidate['sequence'] > $best['sequence']
@@ -747,12 +553,9 @@ function qs_nr_deploy_tag(callable $git, string $environment): string {
 /**
  * Picks a human release tag, never another environment's platform tag.
  *
- * A tag like v4.0.14 is a useful version for a marker. A tag belonging to a
- * different environment is not: labelling a live release "pantheon_test_38"
- * is plausible enough to be believed and wrong enough to send a regression
- * investigation to the wrong build. When only foreign platform tags are
- * present, returning nothing lets the caller fall back to the commit SHA,
- * which is honest.
+ * Labelling a live release "pantheon_test_38" is plausible enough to be
+ * believed and wrong enough to misdirect a regression hunt, so returning
+ * nothing lets the caller fall back to the commit SHA.
  */
 function qs_nr_non_platform_tag(array $tags): string {
   foreach ($tags as $tag) {
@@ -767,11 +570,9 @@ function qs_nr_non_platform_tag(array $tags): string {
 /**
  * Rejects tag names that are unsafe to pass to git as an argument.
  *
- * escapeshellarg() protects the shell, but git still reads a leading dash as
- * an option: a tag literally named "--points-at=HEAD" turns `git tag -l -n99
- * <tag>` into a listing of every tag. Such names cannot be created with
- * `git tag`, but `git update-ref` makes them and a push carries them, so they
- * have to be filtered rather than assumed away.
+ * escapeshellarg() protects the shell but not git's option parsing: a tag named
+ * "--points-at=HEAD" turns a tag lookup into a listing of every tag. `git tag`
+ * will not create such names, but `git update-ref` will and a push carries it.
  */
 function qs_nr_tag_is_safe(string $tag): bool {
   if ($tag === '' || strpos($tag, '-') === 0) {
@@ -782,11 +583,10 @@ function qs_nr_tag_is_safe(string $tag): bool {
 }
 
 /**
- * Reads a tag's annotation without the tag name git prefixes it with.
+ * Reads an annotated tag's message, without the tag name git prefixes it with.
  *
- * Only annotated tags have an annotation. For a lightweight tag, `git tag -n`
- * falls back to printing the tagged commit's subject, which would present a
- * commit message as though it were a release note.
+ * Lightweight tags are skipped: `git tag -n` falls back to printing the tagged
+ * commit's subject, which would read as a release note without being one.
  */
 function qs_nr_tag_annotation(callable $git, string $tag): string {
   if ($git('cat-file -t ' . escapeshellarg('refs/tags/' . $tag)) !== 'tag') {
@@ -803,10 +603,7 @@ function qs_nr_tag_annotation(callable $git, string $tag): string {
 }
 
 /**
- * Truncates a string, marking it so a reader knows something was cut.
- *
- * Never returns more than $limit bytes, including the marker, so that a
- * caller's budget arithmetic holds even for very small limits.
+ * Truncates a string, marking it, never exceeding $limit bytes in total.
  */
 function qs_nr_clamp(string $text, int $limit): string {
   if ($limit <= 0) {
@@ -827,11 +624,6 @@ function qs_nr_clamp(string $text, int $limit): string {
 
 /**
  * Cuts a string to a byte budget without splitting a character.
- *
- * A byte-wise substr() can leave half a multi-byte character at the end, which
- * is invalid UTF-8. json_encode() only tolerates that because of
- * JSON_INVALID_UTF8_SUBSTITUTE, and the reader still sees a replacement
- * character, so cut on a character boundary where mbstring is available.
  */
 function qs_nr_cut(string $text, int $bytes): string {
   if ($bytes <= 0) {
@@ -848,15 +640,10 @@ function qs_nr_cut(string $text, int $bytes): string {
 /**
  * Identifies who triggered the workflow.
  *
- * The workflow's own user_email is authoritative and is preferred whenever it
- * is present. Only when it is absent does a code sync fall back to the commit
- * author, and only for user_role "super".
- *
- * Pantheon publishes no vocabulary for user_role; "super" has meant an
- * in-dashboard SFTP commit since their 2016 example script, where the acting
- * user appears in the commit rather than the payload. That is a heuristic
- * inherited from quicksilver-examples/new_relic_deploy, not a documented rule,
- * which is why it now only ever adds information rather than overriding it.
+ * The workflow's user_email is authoritative. The commit-author fallback is a
+ * heuristic inherited from Pantheon's example, where user_role "super" means an
+ * in-dashboard commit; it is limited to code syncs because a promotion's tip
+ * commit is authored by Pantheon's own bot.
  */
 function qs_nr_deploying_user(array $post, callable $git): string {
   $email = qs_nr_scalar($post, 'user_email');
@@ -864,9 +651,6 @@ function qs_nr_deploying_user(array $post, callable $git): string {
     return $email;
   }
 
-  // Only a code sync has an authored commit at the tip worth falling back to.
-  // On a promotion the tip is Pantheon's build artifact, authored by
-  // bot@getpantheon.com, which would attribute the deploy to the platform.
   if (qs_nr_scalar($post, 'wf_type') === 'deploy') {
     return '';
   }
@@ -896,11 +680,8 @@ function qs_nr_provenance(string $wf_type, array $post): string {
 /**
  * Builds the entity search request for an APM application by name.
  *
- * queryBuilder takes typed fields, so the application name travels as a
- * GraphQL variable and never as text spliced into a query string. The name
- * filter is not an exact comparison -- a search for "site (live)" also returns
- * "site (lastlive)" -- so the response is filtered by exact name afterwards,
- * and `nextCursor` is followed because one page holds at most 200 entities.
+ * The name travels as a typed variable rather than spliced into the query. The
+ * filter is a substring match, so results still need filtering by exact name.
  */
 function qs_nr_entity_search_payload(string $app_name, ?string $cursor = NULL): array {
   return [
@@ -932,8 +713,8 @@ function qs_nr_next_cursor($response): ?string {
 /**
  * Builds the changeTrackingCreateDeployment request.
  *
- * The deployment travels as a typed GraphQL variable, so commit messages
- * containing quotes, newlines or backslashes reach New Relic intact.
+ * The deployment travels as a typed variable, so commit messages containing
+ * quotes, newlines or backslashes reach New Relic intact.
  */
 function qs_nr_deployment_payload(array $deployment): array {
   return [
@@ -949,18 +730,15 @@ function qs_nr_deployment_payload(array $deployment): array {
 /**
  * Returns the entity GUID whose name matches exactly, or NULL.
  *
- * New Relic's entity search treats `. , ; : * - _ ( )` as whitespace and
- * matches names as substrings, so a search for "site (live)" also returns
- * "site (lastlive)". Only an exact name is safe to post against; anything
- * else risks attributing a deploy to a different environment.
+ * Entity search treats `. , ; : * - _ ( )` as whitespace and matches substrings,
+ * so a search for "site (live)" also returns "site (lastlive)". Only an exact
+ * name is safe: a near match would attribute the deploy to another environment.
  */
 function qs_nr_extract_entity_guid($response, string $app_name): ?string {
   foreach (qs_nr_entities($response) as $entity) {
     $name = $entity['name'] ?? NULL;
     $guid = $entity['guid'] ?? NULL;
 
-    // A hostile or malformed response can put an array where a string belongs;
-    // casting one would emit a warning and produce the string "Array".
     if (!is_string($name) || !is_string($guid) || $guid === '') {
       continue;
     }
@@ -975,10 +753,11 @@ function qs_nr_extract_entity_guid($response, string $app_name): ?string {
 
 /**
  * Lists the entities in an entity search response.
+ *
+ * Untyped input: a transport can hand back NULL for a non-JSON body, and a
+ * TypeError here would abort a hook that must not throw.
  */
 function qs_nr_entities($response): array {
-  // Untyped: a transport can legitimately hand back NULL for a non-JSON body,
-  // and a TypeError here would abort a deploy hook that must not throw.
   $entities = qs_nr_dig($response, [
     'data', 'actor', 'entitySearch', 'results', 'entities',
   ]);
@@ -992,13 +771,14 @@ function qs_nr_entities($response): array {
 
 /**
  * Names the entities a search returned, for diagnostics.
+ *
+ * Slices before mapping: a cap-sized response of empty objects decodes to
+ * hundreds of thousands of arrays, and mapping them all would turn the byte cap
+ * into an out-of-memory fatal.
  */
 function qs_nr_entity_names($response, ?int $limit = NULL): array {
   $limit = $limit ?? QS_NR_MAX_CANDIDATES_LOGGED + 1;
 
-  // Slice before mapping. A cap-sized response of empty objects decodes to
-  // hundreds of thousands of arrays, and mapping over all of them would
-  // amplify the byte cap into an out-of-memory fatal.
   return array_map(static function (array $entity): string {
     return qs_nr_printable($entity['name'] ?? 'unnamed');
   }, array_slice(qs_nr_entities($response), 0, max(0, $limit)));
@@ -1007,8 +787,8 @@ function qs_nr_entity_names($response, ?int $limit = NULL): array {
 /**
  * Builds the curl options for a NerdGraph request.
  *
- * Separated from the call so tests can assert the endpoint, the headers and
- * the timeouts without a network.
+ * Passing $writer swaps CURLOPT_RETURNTRANSFER for a write callback; the two
+ * set the same internal field, so only one may be used.
  */
 function qs_nr_curl_options(string $endpoint, string $api_key, string $body, ?callable $writer = NULL): array {
   $options = [
@@ -1017,11 +797,9 @@ function qs_nr_curl_options(string $endpoint, string $api_key, string $body, ?ca
     CURLOPT_POSTFIELDS => $body,
     CURLOPT_CONNECTTIMEOUT => QS_NR_CONNECT_TIMEOUT,
     CURLOPT_TIMEOUT => QS_NR_HTTP_TIMEOUT,
-    // libcurl aborts before the transfer if the declared size is over the
-    // limit, and since curl 8.4.0 also mid-transfer once the received bytes
-    // exceed it. The write callback below is the backstop for older libcurl,
-    // where only the declared-size check exists and a server can simply omit
-    // Content-Length.
+    // Aborts on an over-limit declared size, and since curl 8.4.0 mid-transfer
+    // too. The write callback is the backstop for older libcurl, where a server
+    // can evade this by omitting Content-Length.
     CURLOPT_MAXFILESIZE => QS_NR_RESPONSE_LIMIT,
     CURLOPT_HTTPHEADER => [
       'Content-Type: application/json',
@@ -1042,13 +820,15 @@ function qs_nr_curl_options(string $endpoint, string $api_key, string $body, ?ca
 /**
  * Builds a bounded response collector.
  *
- * Returning fewer bytes than curl handed over aborts the transfer, which is
- * how the cap is enforced without ever holding the whole body.
+ * Returning fewer bytes than curl handed over aborts the transfer, which caps
+ * the body without ever holding all of it.
  *
  * @param string $buffer
  *   Receives the body, by reference.
  * @param bool $overflowed
  *   Set to TRUE if the cap was hit, by reference.
+ * @param int|null $limit
+ *   Byte cap. Defaults to QS_NR_RESPONSE_LIMIT.
  */
 function qs_nr_response_collector(string &$buffer, bool &$overflowed, ?int $limit = NULL): callable {
   $limit = $limit ?? QS_NR_RESPONSE_LIMIT;
@@ -1068,12 +848,9 @@ function qs_nr_response_collector(string &$buffer, bool &$overflowed, ?int $limi
 /**
  * Encodes a GraphQL request body.
  *
- * JSON_INVALID_UTF8_SUBSTITUTE matters more than it looks: without it a
- * single non-UTF-8 byte in a commit message, which any latin-1 authoring
- * locale produces, makes json_encode() return FALSE and the marker is lost.
- *
- * @return string|null
- *   The encoded body, or NULL if it could not be encoded.
+ * JSON_INVALID_UTF8_SUBSTITUTE is load-bearing: without it one non-UTF-8 byte
+ * in a commit message, which any latin-1 authoring locale produces, makes
+ * json_encode() return FALSE and the marker is lost.
  */
 function qs_nr_encode_body(array $payload): ?string {
   $body = json_encode(
@@ -1115,9 +892,8 @@ function qs_nr_post_graphql(string $endpoint, string $api_key, array $payload): 
   $status = (int) curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
   $transport_error = curl_error($handle);
 
-  // Release the handle. curl_close() is a no-op since PHP 8.0 and deprecated
-  // in 8.5, so unset() is the portable form: CurlHandle is refcounted, and
-  // dropping the last reference frees it immediately.
+  // curl_close() is a no-op since PHP 8.0 and deprecated in 8.5; unset() is the
+  // portable way to free a refcounted CurlHandle.
   unset($handle);
 
   if ($overflowed) {
@@ -1150,7 +926,7 @@ function qs_nr_post_graphql(string $endpoint, string $api_key, array $payload): 
  * still reports its status code rather than hiding behind "not JSON".
  *
  * @return string[]
- *   Problems found, most important first. Empty means the result is usable.
+ *   Problems found. Empty means the result is usable.
  */
 function qs_nr_problems(array $result): array {
   $raw_status = $result['status'] ?? NULL;
@@ -1195,8 +971,6 @@ function qs_nr_problems(array $result): array {
     $problems[] = 'New Relic said: ' . qs_nr_error_text($errors);
   }
   elseif (is_array($errors) && $errors !== []) {
-    // Capped: a cap-sized response of tiny error objects would otherwise
-    // become tens of thousands of log lines.
     foreach (array_slice($errors, 0, QS_NR_MAX_PROBLEMS_REPORTED) as $error) {
       $problems[] = 'New Relic said: ' . qs_nr_error_text($error);
       if (qs_nr_error_code($error) === 'BAD_API_KEY') {
@@ -1239,10 +1013,7 @@ function qs_nr_error_code($error): ?string {
 }
 
 /**
- * Prints anything wrong with a NerdGraph result.
- *
- * @return bool
- *   TRUE when the result is usable and the caller may continue.
+ * Prints anything wrong with a result. Returns TRUE when it is usable.
  */
 function qs_nr_report(array $result, string $stage): bool {
   $problems = qs_nr_problems($result);
@@ -1258,15 +1029,7 @@ function qs_nr_report(array $result, string $stage): bool {
 }
 
 /**
- * Reads a nested value out of a decoded response, or NULL if absent.
- *
- * @param mixed $data
- *   The structure to walk.
- * @param string[] $path
- *   Keys to follow, outermost first.
- *
- * @return mixed
- *   The value found, or NULL.
+ * Follows $path through a decoded response. Returns NULL if any key is absent.
  */
 function qs_nr_dig($data, array $path) {
   foreach ($path as $key) {
@@ -1287,27 +1050,22 @@ function qs_nr_say(string $message): void {
 }
 
 /**
- * Makes an untrusted value safe to put in a log line.
+ * Makes an untrusted value safe and bounded for a log line.
  *
- * Newlines would let a value forge additional log lines, and escape sequences
- * would let it rewrite the reader's terminal, so control characters are
- * replaced rather than printed. The result is also bounded, because the value
- * may be a whole commit message.
+ * Newlines would let a value forge log lines and escape sequences would let it
+ * rewrite the reader's terminal.
  */
 function qs_nr_printable($value, int $limit = 200): string {
   if (!is_scalar($value)) {
     return '(' . gettype($value) . ')';
   }
 
-  $text = (string) $value;
+  // ASCII controls first, so this works on invalid UTF-8 too.
+  $text = (string) preg_replace('/[\x00-\x1F\x7F]/', ' ', (string) $value);
 
-  // ASCII control bytes first, so this works even on invalid UTF-8.
-  $text = (string) preg_replace('/[\x00-\x1F\x7F]/', ' ', $text);
-
-  // Then the characters a byte-wise pass cannot see: C1 controls such as NEL,
-  // the Unicode line and paragraph separators, and the bidi overrides that
-  // reorder displayed text. Requires valid UTF-8, so repair it first, and keep
-  // the byte-wise result if either step fails.
+  // Then C1 controls, line and paragraph separators, and bidi overrides, none
+  // of which a byte-wise pass can see. Needs valid UTF-8, so repair first and
+  // keep the byte-wise result if either step fails.
   if (function_exists('mb_convert_encoding')) {
     $utf8 = mb_convert_encoding($text, 'UTF-8', 'UTF-8');
     if (is_string($utf8)) {
@@ -1322,8 +1080,7 @@ function qs_nr_printable($value, int $limit = 200): string {
   return qs_nr_clamp($text, $limit);
 }
 
-// Tests define QS_NR_NO_RUN so they can load the functions above without
-// firing a deployment marker.
+// Tests define QS_NR_NO_RUN to load these functions without firing a marker.
 if (!defined('QS_NR_NO_RUN')) {
   qs_nr_main($_POST);
 }
